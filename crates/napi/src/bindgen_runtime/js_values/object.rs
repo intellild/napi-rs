@@ -743,51 +743,16 @@ pub unsafe fn set_named_property_raw(
 }
 
 #[doc(hidden)]
-#[inline]
-pub unsafe fn from_raw_required_field<T>(
-  env: sys::napi_env,
-  raw: Option<sys::napi_value>,
-  struct_name: &str,
-  field: &str,
-) -> Result<T>
-where
-  T: FromNapiValue,
-{
-  let Some(raw) = raw else {
-    return Err(crate::missing_field_error(field));
-  };
-
-  unsafe { T::from_napi_value(env, raw) }.map_err(|err| {
-    if struct_name.is_empty() {
-      err
-    } else {
-      crate::decorate_field_error(err, struct_name, field)
-    }
-  })
+pub fn require_raw_field(raw: Option<sys::napi_value>, field: &str) -> Result<sys::napi_value> {
+  raw.ok_or_else(|| crate::missing_field_error(field))
 }
 
 #[doc(hidden)]
-#[inline]
-pub unsafe fn from_raw_optional_field<T>(
-  env: sys::napi_env,
-  raw: Option<sys::napi_value>,
-  struct_name: &str,
-  field: &str,
-) -> Result<Option<T>>
-where
-  T: FromNapiValue,
-{
-  match raw {
-    Some(raw) => unsafe { T::from_napi_value(env, raw) }
-      .map(Some)
-      .map_err(|err| {
-        if struct_name.is_empty() {
-          err
-        } else {
-          crate::decorate_field_error(err, struct_name, field)
-        }
-      }),
-    None => Ok(None),
+pub fn decorate_raw_field_error(err: Error, struct_name: &str, field: &str) -> Error {
+  if struct_name.is_empty() {
+    err
+  } else {
+    crate::decorate_field_error(err, struct_name, field)
   }
 }
 
