@@ -12,7 +12,7 @@ use napi_derive_backend::{
   rm_raw_prefix, to_case, BindgenResult, CallbackArg, Diagnostic, FnKind, FnSelf, Napi, NapiArray,
   NapiClass, NapiConst, NapiEnum, NapiEnumValue, NapiEnumVariant, NapiFn, NapiFnArg, NapiFnArgKind,
   NapiImpl, NapiItem, NapiObject, NapiStruct, NapiStructField, NapiStructKind, NapiStructuredEnum,
-  NapiStructuredEnumVariant, NapiTransparent, NapiType, ObjectCodegenMode,
+  NapiStructuredEnumVariant, NapiTransparent, NapiType,
 };
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::ToTokens;
@@ -51,24 +51,6 @@ static KNOWN_JS_VALUE_TYPES_WITH_LIFETIME: LazyLock<HashSet<&str>> = LazyLock::n
   ]
   .into()
 });
-
-fn object_codegen_mode(opts: &BindgenAttrs) -> BindgenResult<ObjectCodegenMode> {
-  if opts.raw_fields().is_some() {
-    Ok(ObjectCodegenMode::Compact)
-  } else if let Some((codegen, span)) = opts.codegen() {
-    match codegen {
-      "auto" => Ok(ObjectCodegenMode::Auto),
-      "inline" => Ok(ObjectCodegenMode::Inline),
-      "compact" => Ok(ObjectCodegenMode::Compact),
-      _ => Err(Diagnostic::span_error(
-        span,
-        "invalid #[napi(object, codegen = ...)] value, expected `auto`, `inline`, or `compact`",
-      )),
-    }
-  } else {
-    Ok(ObjectCodegenMode::Auto)
-  }
-}
 
 fn get_register_ident(name: &str) -> Ident {
   let new_name = format!(
@@ -1345,13 +1327,10 @@ impl ConvertToAST for syn::ItemStruct {
         object_to_js: opts.object_to_js(),
       })
     } else if opts.object().is_some() {
-      let codegen = object_codegen_mode(opts)?;
-
       NapiStructKind::Object(NapiObject {
         fields,
         object_from_js: opts.object_from_js(),
         object_to_js: opts.object_to_js(),
-        codegen,
         is_tuple,
       })
     } else {
@@ -1613,7 +1592,6 @@ impl ConvertToAST for syn::ItemEnum {
         });
       }
       let rust_struct_ident = self.ident.clone();
-      let codegen = object_codegen_mode(opts)?;
       return Diagnostic::from_vec(errors).map(|()| Napi {
         item: NapiItem::Struct(NapiStruct {
           name: rust_struct_ident.clone(),
@@ -1628,7 +1606,6 @@ impl ConvertToAST for syn::ItemEnum {
             discriminant_case,
             object_from_js: opts.object_from_js(),
             object_to_js: opts.object_to_js(),
-            codegen,
           }),
           has_lifetime: false,
           is_generator: false,

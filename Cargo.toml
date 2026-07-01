@@ -9,7 +9,6 @@ members = [
   "./examples/napi",
   "./examples/napi-shared",
   "./examples/napi-compat-mode",
-  "./examples/bench-codegen",
   "./examples/binary",
   "./bench",
   "./memory-testing",

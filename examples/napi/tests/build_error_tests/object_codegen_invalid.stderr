@@ -1,5 +1,0 @@
-error: invalid #[napi(object, codegen = ...)] value, expected `auto`, `inline`, or `compact`
- --> tests/build_error_tests/object_codegen_invalid.rs:3:26
-  |
-3 | #[napi(object, codegen = "tiny")]
-  |                          ^^^^^^
