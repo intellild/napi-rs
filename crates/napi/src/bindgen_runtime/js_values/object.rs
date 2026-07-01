@@ -742,9 +742,39 @@ pub unsafe fn set_named_property_raw(
   )
 }
 
+/// # Safety
+///
+/// The caller must ensure that `env` and `obj` are valid N-API handles, and
+/// `field` points to a valid nul-terminated C string.
 #[doc(hidden)]
-pub fn require_raw_field(raw: Option<sys::napi_value>, field: &str) -> Result<sys::napi_value> {
-  raw.ok_or_else(|| crate::missing_field_error(field))
+pub unsafe fn get_required_named_property_raw(
+  env: sys::napi_env,
+  obj: sys::napi_value,
+  field: *const c_char,
+  field_name: &str,
+) -> Result<sys::napi_value> {
+  let raw = unsafe { get_named_property_raw(env, obj, field) }?;
+  raw.ok_or_else(|| crate::missing_field_error(field_name))
+}
+
+/// # Safety
+///
+/// The caller must ensure that `env` and `obj` are valid N-API handles, and
+/// `field` points to a valid nul-terminated C string.
+#[doc(hidden)]
+pub unsafe fn get_optional_named_property_raw(
+  env: sys::napi_env,
+  obj: sys::napi_value,
+  field: *const c_char,
+) -> Result<sys::napi_value> {
+  let mut ret = ptr::null_mut();
+
+  check_status!(
+    unsafe { sys::napi_get_named_property(env, obj, field, &mut ret) },
+    "Failed to get property",
+  )?;
+
+  Ok(ret)
 }
 
 #[doc(hidden)]

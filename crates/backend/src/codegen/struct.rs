@@ -157,28 +157,16 @@ fn gen_napi_value_map_impl(
   }
 }
 
-fn option_inner_type(ty: &syn::Type) -> Option<syn::Type> {
-  let syn::Type::Path(syn::TypePath {
+fn is_option_type(ty: &syn::Type) -> bool {
+  if let syn::Type::Path(syn::TypePath {
     path: syn::Path { segments, .. },
     ..
   }) = ty
-  else {
-    return None;
-  };
-
-  let last_path = segments.last()?;
-  if last_path.ident != "Option" {
-    return None;
+  {
+    matches!(segments.last(), Some(last_path) if last_path.ident == "Option")
+  } else {
+    false
   }
-
-  let syn::PathArguments::AngleBracketed(args) = &last_path.arguments else {
-    return None;
-  };
-
-  args.args.iter().find_map(|arg| match arg {
-    syn::GenericArgument::Type(ty) => Some(ty.clone()),
-    _ => None,
-  })
 }
 
 fn gen_field_name_c_string(field_js_name: &str) -> TokenStream {
@@ -218,31 +206,27 @@ fn gen_raw_field_getter(
   value_ident: &Ident,
   raw_ident: &Ident,
   ty: &syn::Type,
-  option_inner_ty: Option<&syn::Type>,
   field_js_name: &str,
   field_name_c_string: &TokenStream,
   struct_name: &str,
+  is_optional_field: bool,
   use_nullable: bool,
   obj_raw: TokenStream,
 ) -> TokenStream {
-  if let Some(inner_ty) = option_inner_ty.filter(|_| !use_nullable) {
+  let raw_getter = if is_optional_field && !use_nullable {
     quote! {
-      let #raw_ident = napi::bindgen_prelude::get_named_property_raw(env, #obj_raw, #field_name_c_string)?;
-      let #value_ident: #ty = match #raw_ident {
-        Some(raw) => Some(
-          <#inner_ty as napi::bindgen_prelude::FromNapiValue>::from_napi_value(env, raw)
-            .map_err(|err| napi::bindgen_prelude::decorate_raw_field_error(err, #struct_name, #field_js_name))?
-        ),
-        None => None,
-      };
+      napi::bindgen_prelude::get_optional_named_property_raw(env, #obj_raw, #field_name_c_string)?
     }
   } else {
     quote! {
-      let #raw_ident = napi::bindgen_prelude::get_named_property_raw(env, #obj_raw, #field_name_c_string)?;
-      let #raw_ident = napi::bindgen_prelude::require_raw_field(#raw_ident, #field_js_name)?;
-      let #value_ident: #ty = <#ty as napi::bindgen_prelude::FromNapiValue>::from_napi_value(env, #raw_ident)
-        .map_err(|err| napi::bindgen_prelude::decorate_raw_field_error(err, #struct_name, #field_js_name))?;
+      napi::bindgen_prelude::get_required_named_property_raw(env, #obj_raw, #field_name_c_string, #field_js_name)?
     }
+  };
+
+  quote! {
+    let #raw_ident = #raw_getter;
+    let #value_ident: #ty = <#ty as napi::bindgen_prelude::FromNapiValue>::from_napi_value(env, #raw_ident)
+      .map_err(|err| napi::bindgen_prelude::decorate_raw_field_error(err, #struct_name, #field_js_name))?;
   }
 }
 
@@ -631,8 +615,7 @@ impl NapiStruct {
       let field_name_c_string = gen_field_name_c_string(field_js_name);
       let mut ty = field.ty.clone();
       remove_lifetime_in_type(&mut ty);
-      let option_inner_ty = option_inner_type(&ty);
-      let is_optional_field = option_inner_ty.is_some();
+      let is_optional_field = is_option_type(&ty);
 
       // Determine if this field is always set or conditionally set
       let is_always_set = !is_optional_field || self.use_nullable;
@@ -681,10 +664,10 @@ impl NapiStruct {
             &alias_ident,
             &raw_ident,
             &ty,
-            option_inner_ty.as_ref(),
             field_js_name,
             &field_name_c_string,
             &name_str,
+            is_optional_field,
             self.use_nullable,
             quote! { obj_raw },
           ));
@@ -732,10 +715,10 @@ impl NapiStruct {
             &arg_name,
             &raw_ident,
             &ty,
-            option_inner_ty.as_ref(),
             field_js_name,
             &field_name_c_string,
             "",
+            is_optional_field,
             self.use_nullable,
             quote! { obj_raw },
           ));
@@ -1097,8 +1080,7 @@ impl NapiStruct {
         let field_name_c_string = gen_field_name_c_string(field_js_name);
         let mut ty = field.ty.clone();
         remove_lifetime_in_type(&mut ty);
-        let option_inner_ty = option_inner_type(&ty);
-        let is_optional_field = option_inner_ty.is_some();
+        let is_optional_field = is_option_type(&ty);
 
         // Determine if this field is always set or conditionally set
         let is_always_set = !is_optional_field || self.use_nullable;
@@ -1146,10 +1128,10 @@ impl NapiStruct {
               &alias_ident,
               &raw_ident,
               &ty,
-              option_inner_ty.as_ref(),
               field_js_name,
               &field_name_c_string,
               &name_str,
+              is_optional_field,
               self.use_nullable,
               quote! { obj_raw },
             ));
@@ -1196,10 +1178,10 @@ impl NapiStruct {
               &arg_name,
               &raw_ident,
               &ty,
-              option_inner_ty.as_ref(),
               field_js_name,
               &field_name_c_string,
               "",
+              is_optional_field,
               self.use_nullable,
               quote! { obj_raw },
             ));
@@ -1284,13 +1266,10 @@ impl NapiStruct {
             #[allow(unused_variables)]
             let env_wrapper = napi::bindgen_prelude::Env::from(env);
             let obj_raw = napi_val;
-            let __discriminant_raw = napi::bindgen_prelude::get_named_property_raw(
+            let __discriminant_raw = napi::bindgen_prelude::get_required_named_property_raw(
               env,
               obj_raw,
               #discriminant_c_string,
-            )?;
-            let __discriminant_raw = napi::bindgen_prelude::require_raw_field(
-              __discriminant_raw,
               #discriminant,
             )?;
             let type_: String = <String as napi::bindgen_prelude::FromNapiValue>::from_napi_value(env, __discriminant_raw)
