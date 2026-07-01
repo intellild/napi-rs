@@ -405,6 +405,14 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@examples/bench-codegen@workspace:examples/bench-codegen":
+  version: 0.0.0-use.local
+  resolution: "@examples/bench-codegen@workspace:examples/bench-codegen"
+  dependencies:
+    "@napi-rs/cli": "workspace:*"
+  languageName: unknown
+  linkType: soft
+
 "@examples/compat-mode@workspace:examples/napi-compat-mode":
   version: 0.0.0-use.local
   resolution: "@examples/compat-mode@workspace:examples/napi-compat-mode"

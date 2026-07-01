@@ -11,6 +11,7 @@
     "memory-testing",
     "examples/napi",
     "examples/napi-compat-mode",
+    "examples/bench-codegen",
     "examples/binary"
   ],
   "repository": {

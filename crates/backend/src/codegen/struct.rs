@@ -10,7 +10,9 @@ use crate::{
   codegen::{get_intermediate_ident, js_mod_to_token_stream},
   BindgenResult, FnKind, NapiImpl, NapiStruct, NapiStructKind, TryToTokens,
 };
-use crate::{NapiArray, NapiClass, NapiObject, NapiStructuredEnum, NapiTransparent};
+use crate::{
+  NapiArray, NapiClass, NapiObject, NapiStructuredEnum, NapiTransparent, ObjectCodegenMode,
+};
 
 static NAPI_IMPL_ID: AtomicU32 = AtomicU32::new(0);
 
@@ -269,7 +271,7 @@ impl NapiStruct {
         self.gen_to_napi_value_ctor_impl(class),
         self.has_lifetime,
       ),
-      NapiStructKind::Object(obj) => self.gen_to_napi_value_obj_impl(obj),
+      NapiStructKind::Object(obj) => self.gen_napi_value_obj_impl(obj),
       NapiStructKind::StructuredEnum(structured_enum) => {
         self.gen_to_napi_value_structured_enum_impl(structured_enum)
       }
@@ -511,7 +513,250 @@ impl NapiStruct {
     }
   }
 
-  fn gen_to_napi_value_obj_impl(&self, obj: &NapiObject) -> TokenStream {
+  fn object_codegen_score(&self, obj: &NapiObject) -> usize {
+    let option_field_count = obj
+      .fields
+      .iter()
+      .filter(|field| Self::is_option_type(&field.ty))
+      .count();
+    let nullable_field_count = if self.use_nullable {
+      option_field_count
+    } else {
+      0
+    };
+    let union_field_count = obj
+      .fields
+      .iter()
+      .filter(|field| Self::type_contains_token(&field.ty, "Either"))
+      .count();
+    let promise_field_count = obj
+      .fields
+      .iter()
+      .filter(|field| Self::type_contains_token(&field.ty, "Promise"))
+      .count();
+
+    obj.fields.len()
+      + option_field_count
+      + nullable_field_count
+      + union_field_count * 2
+      + promise_field_count * 2
+  }
+
+  fn structured_enum_codegen_score(&self, structured_enum: &NapiStructuredEnum) -> usize {
+    let fields = structured_enum
+      .variants
+      .iter()
+      .flat_map(|variant| variant.fields.iter())
+      .collect::<Vec<_>>();
+    let option_field_count = fields
+      .iter()
+      .filter(|field| Self::is_option_type(&field.ty))
+      .count();
+    let nullable_field_count = if self.use_nullable {
+      option_field_count
+    } else {
+      0
+    };
+    let union_field_count = fields
+      .iter()
+      .filter(|field| Self::type_contains_token(&field.ty, "Either"))
+      .count();
+    let promise_field_count = fields
+      .iter()
+      .filter(|field| Self::type_contains_token(&field.ty, "Promise"))
+      .count();
+
+    fields.len()
+      + option_field_count
+      + nullable_field_count
+      + union_field_count * 2
+      + promise_field_count * 2
+      + structured_enum.variants.len() * 2
+  }
+
+  fn is_option_type(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(syn::TypePath {
+      path: syn::Path { segments, .. },
+      ..
+    }) = ty
+    {
+      segments
+        .last()
+        .map(|last_path| last_path.ident == "Option")
+        .unwrap_or(false)
+    } else {
+      false
+    }
+  }
+
+  fn type_contains_token(ty: &syn::Type, token: &str) -> bool {
+    ty.to_token_stream().to_string().contains(token)
+  }
+
+  fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(syn::TypePath {
+      path: syn::Path { segments, .. },
+      ..
+    }) = ty
+    else {
+      return None;
+    };
+
+    let last_path = segments.last()?;
+    if last_path.ident != "Option" {
+      return None;
+    }
+
+    let syn::PathArguments::AngleBracketed(args) = &last_path.arguments else {
+      return None;
+    };
+
+    let syn::GenericArgument::Type(inner_ty) = args.args.first()? else {
+      return None;
+    };
+
+    Some(inner_ty)
+  }
+
+  fn either_type_parts(ty: &syn::Type) -> Option<(TokenStream, Vec<syn::Type>)> {
+    let syn::Type::Path(type_path) = ty else {
+      return None;
+    };
+
+    let mut enum_path = type_path.path.clone();
+    let last_segment = enum_path.segments.last_mut()?;
+    if !last_segment.ident.to_string().starts_with("Either") {
+      return None;
+    }
+
+    let syn::PathArguments::AngleBracketed(args) = &last_segment.arguments else {
+      return None;
+    };
+
+    let mut arm_tys = vec![];
+    for arg in args.args.iter() {
+      let syn::GenericArgument::Type(ty) = arg else {
+        return None;
+      };
+      arm_tys.push(ty.clone());
+    }
+
+    last_segment.arguments = syn::PathArguments::None;
+    Some((quote! { #enum_path }, arm_tys))
+  }
+
+  fn gen_union_field_from_raw(
+    &self,
+    target_ident: &Ident,
+    ty: &syn::Type,
+    raw_field_var: &Ident,
+    name_str: &str,
+    field_js_name: &str,
+    optional_missing_as_none: bool,
+  ) -> Option<TokenStream> {
+    let (field_ty, is_optional_union) = if let Some(inner_ty) = Self::option_inner_type(ty) {
+      (inner_ty, true)
+    } else {
+      (ty, false)
+    };
+
+    if is_optional_union && !optional_missing_as_none {
+      return None;
+    }
+
+    let (enum_path, arm_tys) = Self::either_type_parts(field_ty)?;
+    let variant_names = (b'A'..=b'Z')
+      .take(arm_tys.len())
+      .map(|name| Ident::new(&(name as char).to_string(), Span::call_site()))
+      .collect::<Vec<_>>();
+    let branch_indexes = (0..arm_tys.len()).collect::<Vec<_>>();
+
+    let arm_descriptors = arm_tys.iter().map(|arm_ty| {
+      quote! {
+        napi::bindgen_prelude::UnionArmDescriptor {
+          type_name: <#arm_ty as napi::bindgen_prelude::TypeName>::type_name,
+          validate: <#arm_ty as napi::bindgen_prelude::ValidateNapiValue>::validate,
+        }
+      }
+    });
+    let branch_conversions = branch_indexes
+      .iter()
+      .zip(arm_tys.iter())
+      .zip(variant_names.iter())
+      .map(|((index, arm_ty), variant)| {
+        quote! {
+          #index => <#arm_ty as napi::bindgen_prelude::FromNapiValue>::from_napi_value(env, __obj_union_value)
+            .map(#enum_path::#variant),
+        }
+      });
+
+    if is_optional_union {
+      Some(quote! {
+        let #target_ident: #ty = match #raw_field_var {
+          Some(__obj_union_value) => {
+            let __obj_union_branch = napi::bindgen_prelude::select_union_arm(
+              env,
+              __obj_union_value,
+              &[#(#arm_descriptors),*],
+            )
+            .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #field_js_name))?;
+            Some(match __obj_union_branch {
+              #(#branch_conversions)*
+              _ => unreachable!("select_union_arm returned an out-of-range branch"),
+            }
+            .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #field_js_name))?)
+          }
+          None => None,
+        };
+      })
+    } else {
+      Some(quote! {
+        let __obj_union_value = #raw_field_var
+          .ok_or_else(|| napi::bindgen_prelude::missing_field_error(#field_js_name))?;
+        let __obj_union_branch = napi::bindgen_prelude::select_union_arm(
+          env,
+          __obj_union_value,
+          &[#(#arm_descriptors),*],
+        )
+        .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #field_js_name))?;
+        let #target_ident: #ty = match __obj_union_branch {
+          #(#branch_conversions)*
+          _ => unreachable!("select_union_arm returned an out-of-range branch"),
+        }
+        .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #field_js_name))?;
+      })
+    }
+  }
+
+  fn gen_napi_value_obj_impl(&self, obj: &NapiObject) -> TokenStream {
+    match obj.codegen {
+      ObjectCodegenMode::Inline => self.gen_napi_value_obj_inline_impl(obj),
+      ObjectCodegenMode::Compact => self.gen_napi_value_obj_compact_impl(obj),
+      ObjectCodegenMode::Auto => {
+        let score = self.object_codegen_score(obj);
+        self.gen_napi_value_obj_impl_with_mode(
+          obj,
+          obj.object_from_js && score >= 4,
+          obj.object_to_js && score >= 6,
+        )
+      }
+    }
+  }
+
+  fn gen_napi_value_obj_inline_impl(&self, obj: &NapiObject) -> TokenStream {
+    self.gen_napi_value_obj_impl_with_mode(obj, false, false)
+  }
+
+  fn gen_napi_value_obj_compact_impl(&self, obj: &NapiObject) -> TokenStream {
+    self.gen_napi_value_obj_impl_with_mode(obj, true, true)
+  }
+
+  fn gen_napi_value_obj_impl_with_mode(
+    &self,
+    obj: &NapiObject,
+    compact_from: bool,
+    compact_to: bool,
+  ) -> TokenStream {
     let name = &self.name;
     let name_str = self.name.to_string();
 
@@ -572,31 +817,116 @@ impl NapiStruct {
               });
             }
 
-            property_descriptors.push(quote! {
-              napi::bindgen_prelude::sys::napi_property_descriptor {
-                utf8name: std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()).as_ptr(),
-                name: std::ptr::null_mut(),
-                method: None,
-                getter: None,
-                setter: None,
-                value: #value_var,
-                attributes: napi::bindgen_prelude::sys::PropertyAttributes::writable
-                  | napi::bindgen_prelude::sys::PropertyAttributes::enumerable
-                  | napi::bindgen_prelude::sys::PropertyAttributes::configurable,
-                data: std::ptr::null_mut(),
-              }
-            });
+            if compact_to {
+              property_descriptors.push(quote! {
+                napi::bindgen_prelude::create_property_descriptor(
+                  std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                  #value_var,
+                )
+              });
+            } else {
+              property_descriptors.push(quote! {
+                napi::bindgen_prelude::sys::napi_property_descriptor {
+                  utf8name: std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()).as_ptr(),
+                  name: std::ptr::null_mut(),
+                  method: None,
+                  getter: None,
+                  setter: None,
+                  value: #value_var,
+                  attributes: napi::bindgen_prelude::sys::PropertyAttributes::writable
+                    | napi::bindgen_prelude::sys::PropertyAttributes::enumerable
+                    | napi::bindgen_prelude::sys::PropertyAttributes::configurable,
+                  data: std::ptr::null_mut(),
+                }
+              });
+            }
           } else {
             // Optional with use_nullable=false: conditionally set
-            conditional_setters.push(quote! {
-              if #alias_ident.is_some() {
-                obj.set(#field_js_name, #alias_ident)?;
+            if compact_to {
+              conditional_setters.push(quote! {
+                if #alias_ident.is_some() {
+                  napi::bindgen_prelude::set_named_property_raw(
+                    env,
+                    obj_ptr,
+                    std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                    #alias_ident,
+                  )?;
+                }
+              });
+            } else {
+              if compact_to {
+                conditional_setters.push(quote! {
+                  if #alias_ident.is_some() {
+                    napi::bindgen_prelude::set_named_property_raw(
+                      env,
+                      obj_ptr,
+                      std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                      #alias_ident,
+                    )?;
+                  }
+                });
+              } else {
+                conditional_setters.push(quote! {
+                  if #alias_ident.is_some() {
+                    obj.set(#field_js_name, #alias_ident)?;
+                  }
+                });
               }
-            });
+            }
           }
 
-          // Getters remain the same
-          if is_optional_field && !self.use_nullable {
+          if compact_from {
+            let raw_field_var = Ident::new(&format!("__obj_raw_field_{}", idx), Span::call_site());
+            let union_getter = self.gen_union_field_from_raw(
+              &alias_ident,
+              &ty,
+              &raw_field_var,
+              &name_str,
+              field_js_name,
+              is_optional_field && !self.use_nullable,
+            );
+            if let Some(union_getter) = union_getter {
+              obj_field_getters.push(quote! {
+                let #raw_field_var = napi::bindgen_prelude::get_named_property_raw(
+                  env,
+                  napi_val,
+                  std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                )
+                .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #field_js_name))?;
+                #union_getter
+              });
+            } else if is_optional_field && !self.use_nullable {
+              obj_field_getters.push(quote! {
+                let #raw_field_var = napi::bindgen_prelude::get_named_property_raw(
+                  env,
+                  napi_val,
+                  std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                )
+                .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #field_js_name))?;
+                let #alias_ident: #ty = napi::bindgen_prelude::from_raw_optional_field(
+                  env,
+                  #raw_field_var,
+                  #name_str,
+                  #field_js_name,
+                )?;
+              });
+            } else {
+              obj_field_getters.push(quote! {
+                let #raw_field_var = napi::bindgen_prelude::get_named_property_raw(
+                  env,
+                  napi_val,
+                  std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                )
+                .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #field_js_name))?;
+                let #alias_ident: #ty = napi::bindgen_prelude::from_raw_required_field(
+                  env,
+                  #raw_field_var,
+                  #name_str,
+                  #field_js_name,
+                )?;
+              });
+            }
+          } else if is_optional_field && !self.use_nullable {
             obj_field_getters.push(quote! {
               let #alias_ident: #ty = obj.get(#field_js_name)
                 .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #field_js_name))?;
@@ -634,31 +964,113 @@ impl NapiStruct {
               });
             }
 
-            property_descriptors.push(quote! {
-              napi::bindgen_prelude::sys::napi_property_descriptor {
-                utf8name: std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()).as_ptr(),
-                name: std::ptr::null_mut(),
-                method: None,
-                getter: None,
-                setter: None,
-                value: #value_var,
-                attributes: napi::bindgen_prelude::sys::PropertyAttributes::writable
-                  | napi::bindgen_prelude::sys::PropertyAttributes::enumerable
-                  | napi::bindgen_prelude::sys::PropertyAttributes::configurable,
-                data: std::ptr::null_mut(),
-              }
-            });
+            if compact_to {
+              property_descriptors.push(quote! {
+                napi::bindgen_prelude::create_property_descriptor(
+                  std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                  #value_var,
+                )
+              });
+            } else {
+              property_descriptors.push(quote! {
+                napi::bindgen_prelude::sys::napi_property_descriptor {
+                  utf8name: std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()).as_ptr(),
+                  name: std::ptr::null_mut(),
+                  method: None,
+                  getter: None,
+                  setter: None,
+                  value: #value_var,
+                  attributes: napi::bindgen_prelude::sys::PropertyAttributes::writable
+                    | napi::bindgen_prelude::sys::PropertyAttributes::enumerable
+                    | napi::bindgen_prelude::sys::PropertyAttributes::configurable,
+                  data: std::ptr::null_mut(),
+                }
+              });
+            }
           } else {
             // Optional with use_nullable=false: conditionally set
-            conditional_setters.push(quote! {
-              if #arg_name.is_some() {
-                obj.set(#field_js_name, #arg_name)?;
+            if compact_to {
+              conditional_setters.push(quote! {
+                if #arg_name.is_some() {
+                  napi::bindgen_prelude::set_named_property_raw(
+                    env,
+                    obj_ptr,
+                    std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                    #arg_name,
+                  )?;
+                }
+              });
+            } else {
+              if compact_to {
+                conditional_setters.push(quote! {
+                  if #arg_name.is_some() {
+                    napi::bindgen_prelude::set_named_property_raw(
+                      env,
+                      obj_ptr,
+                      std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                      #arg_name,
+                    )?;
+                  }
+                });
+              } else {
+                conditional_setters.push(quote! {
+                  if #arg_name.is_some() {
+                    obj.set(#field_js_name, #arg_name)?;
+                  }
+                });
               }
-            });
+            }
           }
 
-          // Getters remain the same
-          if is_optional_field && !self.use_nullable {
+          if compact_from {
+            let raw_field_var = Ident::new(&format!("__obj_raw_field_{}", idx), Span::call_site());
+            let union_getter = self.gen_union_field_from_raw(
+              &arg_name,
+              &ty,
+              &raw_field_var,
+              &name_str,
+              field_js_name,
+              is_optional_field && !self.use_nullable,
+            );
+            if let Some(union_getter) = union_getter {
+              obj_field_getters.push(quote! {
+                let #raw_field_var = napi::bindgen_prelude::get_named_property_raw(
+                  env,
+                  napi_val,
+                  std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                )?;
+                #union_getter
+              });
+            } else if is_optional_field && !self.use_nullable {
+              obj_field_getters.push(quote! {
+                let #raw_field_var = napi::bindgen_prelude::get_named_property_raw(
+                  env,
+                  napi_val,
+                  std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                )?;
+                let #arg_name: #ty = napi::bindgen_prelude::from_raw_optional_field(
+                  env,
+                  #raw_field_var,
+                  #name_str,
+                  #field_js_name,
+                )?;
+              });
+            } else {
+              obj_field_getters.push(quote! {
+                let #raw_field_var = napi::bindgen_prelude::get_named_property_raw(
+                  env,
+                  napi_val,
+                  std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                )?;
+                let #arg_name: #ty = napi::bindgen_prelude::from_raw_required_field(
+                  env,
+                  #raw_field_var,
+                  #name_str,
+                  #field_js_name,
+                )?;
+              });
+            }
+          } else if is_optional_field && !self.use_nullable {
             obj_field_getters.push(quote! { let #arg_name: #ty = obj.get(#field_js_name)?; });
           } else {
             obj_field_getters.push(quote! {
@@ -716,6 +1128,22 @@ impl NapiStruct {
         let obj_ptr = napi::bindgen_prelude::create_object_with_properties(env, &properties)?;
         Ok(obj_ptr)
       }
+    } else if compact_to {
+      // Some fields are conditionally set - use batched for always-set, then add raw conditionals
+      quote! {
+        // Convert all always-set values first
+        #(#value_conversions)*
+
+        let properties = [
+          #(#property_descriptors),*
+        ];
+
+        let obj_ptr = napi::bindgen_prelude::create_object_with_properties(env, &properties)?;
+
+        #(#conditional_setters)*
+
+        Ok(obj_ptr)
+      }
     } else {
       // Some fields are conditionally set - use batched for always-set, then add conditionals
       quote! {
@@ -766,7 +1194,7 @@ impl NapiStruct {
           ) -> napi::bindgen_prelude::Result<#return_type> {
             #[allow(unused_variables)]
             let env_wrapper = napi::bindgen_prelude::Env::from(env);
-            #[allow(unused_mut)]
+            #[allow(unused_mut, unused_variables)]
             let mut obj = napi::bindgen_prelude::Object::from_napi_value(env, napi_val)?;
 
             #(#obj_field_getters)*
@@ -994,6 +1422,17 @@ impl NapiStruct {
     let name_str = self.name.to_string();
     let discriminant = structured_enum.discriminant.as_str();
     let discriminant_null_terminated = format!("{}\0", discriminant);
+    let (compact_from, compact_to) = match structured_enum.codegen {
+      ObjectCodegenMode::Inline => (false, false),
+      ObjectCodegenMode::Compact => (true, true),
+      ObjectCodegenMode::Auto => {
+        let score = self.structured_enum_codegen_score(structured_enum);
+        (
+          structured_enum.object_from_js && score >= 4,
+          structured_enum.object_to_js && score >= 6,
+        )
+      }
+    };
 
     let mut variant_arm_setters = vec![];
     let mut variant_arm_getters = vec![];
@@ -1018,20 +1457,29 @@ impl NapiStruct {
       value_conversions.push(quote! {
         let #discriminant_value_var = napi::bindgen_prelude::ToNapiValue::to_napi_value(env, #variant_name_str)?;
       });
-      property_descriptors.push(quote! {
-        napi::bindgen_prelude::sys::napi_property_descriptor {
-          utf8name: std::ffi::CStr::from_bytes_with_nul_unchecked(#discriminant_null_terminated.as_bytes()).as_ptr(),
-          name: std::ptr::null_mut(),
-          method: None,
-          getter: None,
-          setter: None,
-          value: #discriminant_value_var,
-          attributes: napi::bindgen_prelude::sys::PropertyAttributes::writable
-                  | napi::bindgen_prelude::sys::PropertyAttributes::enumerable
-                  | napi::bindgen_prelude::sys::PropertyAttributes::configurable,
-          data: std::ptr::null_mut(),
-        }
-      });
+      if compact_to {
+        property_descriptors.push(quote! {
+          napi::bindgen_prelude::create_property_descriptor(
+            std::ffi::CStr::from_bytes_with_nul_unchecked(#discriminant_null_terminated.as_bytes()),
+            #discriminant_value_var,
+          )
+        });
+      } else {
+        property_descriptors.push(quote! {
+          napi::bindgen_prelude::sys::napi_property_descriptor {
+            utf8name: std::ffi::CStr::from_bytes_with_nul_unchecked(#discriminant_null_terminated.as_bytes()).as_ptr(),
+            name: std::ptr::null_mut(),
+            method: None,
+            getter: None,
+            setter: None,
+            value: #discriminant_value_var,
+            attributes: napi::bindgen_prelude::sys::PropertyAttributes::writable
+                    | napi::bindgen_prelude::sys::PropertyAttributes::enumerable
+                    | napi::bindgen_prelude::sys::PropertyAttributes::configurable,
+            data: std::ptr::null_mut(),
+          }
+        });
+      }
 
       for (idx, field) in variant.fields.iter().enumerate() {
         let field_js_name = &field.js_name;
@@ -1080,31 +1528,104 @@ impl NapiStruct {
                 });
               }
 
-              property_descriptors.push(quote! {
-                napi::bindgen_prelude::sys::napi_property_descriptor {
-                  utf8name: std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()).as_ptr(),
-                  name: std::ptr::null_mut(),
-                  method: None,
-                  getter: None,
-                  setter: None,
-                  value: #value_var,
-                  attributes: napi::bindgen_prelude::sys::PropertyAttributes::writable
-                  | napi::bindgen_prelude::sys::PropertyAttributes::enumerable
-                  | napi::bindgen_prelude::sys::PropertyAttributes::configurable,
-                  data: std::ptr::null_mut(),
-                }
-              });
+              if compact_to {
+                property_descriptors.push(quote! {
+                  napi::bindgen_prelude::create_property_descriptor(
+                    std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                    #value_var,
+                  )
+                });
+              } else {
+                property_descriptors.push(quote! {
+                  napi::bindgen_prelude::sys::napi_property_descriptor {
+                    utf8name: std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()).as_ptr(),
+                    name: std::ptr::null_mut(),
+                    method: None,
+                    getter: None,
+                    setter: None,
+                    value: #value_var,
+                    attributes: napi::bindgen_prelude::sys::PropertyAttributes::writable
+                    | napi::bindgen_prelude::sys::PropertyAttributes::enumerable
+                    | napi::bindgen_prelude::sys::PropertyAttributes::configurable,
+                    data: std::ptr::null_mut(),
+                  }
+                });
+              }
             } else {
               // Optional with use_nullable=false: conditionally set
-              conditional_setters.push(quote! {
-                if #alias_ident.is_some() {
-                  obj.set(#field_js_name, #alias_ident)?;
-                }
-              });
+              if compact_to {
+                conditional_setters.push(quote! {
+                  if #alias_ident.is_some() {
+                    napi::bindgen_prelude::set_named_property_raw(
+                      env,
+                      obj_ptr,
+                      std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                      #alias_ident,
+                    )?;
+                  }
+                });
+              } else {
+                conditional_setters.push(quote! {
+                  if #alias_ident.is_some() {
+                    obj.set(#field_js_name, #alias_ident)?;
+                  }
+                });
+              }
             }
 
-            // Getters remain the same
-            if is_optional_field && !self.use_nullable {
+            if compact_from {
+              let raw_field_var =
+                Ident::new(&format!("__variant_raw_field_{}", idx), Span::call_site());
+              let union_getter = self.gen_union_field_from_raw(
+                &alias_ident,
+                &ty,
+                &raw_field_var,
+                &name_str,
+                field_js_name,
+                is_optional_field && !self.use_nullable,
+              );
+              if let Some(union_getter) = union_getter {
+                obj_field_getters.push(quote! {
+                  let #raw_field_var = napi::bindgen_prelude::get_named_property_raw(
+                    env,
+                    napi_val,
+                    std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                  )
+                  .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #field_js_name))?;
+                  #union_getter
+                });
+              } else if is_optional_field && !self.use_nullable {
+                obj_field_getters.push(quote! {
+                  let #raw_field_var = napi::bindgen_prelude::get_named_property_raw(
+                    env,
+                    napi_val,
+                    std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                  )
+                  .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #field_js_name))?;
+                  let #alias_ident: #ty = napi::bindgen_prelude::from_raw_optional_field(
+                    env,
+                    #raw_field_var,
+                    #name_str,
+                    #field_js_name,
+                  )?;
+                });
+              } else {
+                obj_field_getters.push(quote! {
+                  let #raw_field_var = napi::bindgen_prelude::get_named_property_raw(
+                    env,
+                    napi_val,
+                    std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                  )
+                  .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #field_js_name))?;
+                  let #alias_ident: #ty = napi::bindgen_prelude::from_raw_required_field(
+                    env,
+                    #raw_field_var,
+                    #name_str,
+                    #field_js_name,
+                  )?;
+                });
+              }
+            } else if is_optional_field && !self.use_nullable {
               obj_field_getters.push(quote! {
                 let #alias_ident: #ty = obj.get(#field_js_name)
                   .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #field_js_name))?;
@@ -1141,31 +1662,101 @@ impl NapiStruct {
                 });
               }
 
-              property_descriptors.push(quote! {
-                napi::bindgen_prelude::sys::napi_property_descriptor {
-                  utf8name: std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()).as_ptr(),
-                  name: std::ptr::null_mut(),
-                  method: None,
-                  getter: None,
-                  setter: None,
-                  value: #value_var,
-                  attributes: napi::bindgen_prelude::sys::PropertyAttributes::writable
-                  | napi::bindgen_prelude::sys::PropertyAttributes::enumerable
-                  | napi::bindgen_prelude::sys::PropertyAttributes::configurable,
-                  data: std::ptr::null_mut(),
-                }
-              });
+              if compact_to {
+                property_descriptors.push(quote! {
+                  napi::bindgen_prelude::create_property_descriptor(
+                    std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                    #value_var,
+                  )
+                });
+              } else {
+                property_descriptors.push(quote! {
+                  napi::bindgen_prelude::sys::napi_property_descriptor {
+                    utf8name: std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()).as_ptr(),
+                    name: std::ptr::null_mut(),
+                    method: None,
+                    getter: None,
+                    setter: None,
+                    value: #value_var,
+                    attributes: napi::bindgen_prelude::sys::PropertyAttributes::writable
+                    | napi::bindgen_prelude::sys::PropertyAttributes::enumerable
+                    | napi::bindgen_prelude::sys::PropertyAttributes::configurable,
+                    data: std::ptr::null_mut(),
+                  }
+                });
+              }
             } else {
               // Optional with use_nullable=false: conditionally set
-              conditional_setters.push(quote! {
-                if #arg_name.is_some() {
-                  obj.set(#field_js_name, #arg_name)?;
-                }
-              });
+              if compact_to {
+                conditional_setters.push(quote! {
+                  if #arg_name.is_some() {
+                    napi::bindgen_prelude::set_named_property_raw(
+                      env,
+                      obj_ptr,
+                      std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                      #arg_name,
+                    )?;
+                  }
+                });
+              } else {
+                conditional_setters.push(quote! {
+                  if #arg_name.is_some() {
+                    obj.set(#field_js_name, #arg_name)?;
+                  }
+                });
+              }
             }
 
-            // Getters remain the same
-            if is_optional_field && !self.use_nullable {
+            if compact_from {
+              let raw_field_var =
+                Ident::new(&format!("__variant_raw_field_{}", idx), Span::call_site());
+              let union_getter = self.gen_union_field_from_raw(
+                &arg_name,
+                &ty,
+                &raw_field_var,
+                &name_str,
+                field_js_name,
+                is_optional_field && !self.use_nullable,
+              );
+              if let Some(union_getter) = union_getter {
+                obj_field_getters.push(quote! {
+                  let #raw_field_var = napi::bindgen_prelude::get_named_property_raw(
+                    env,
+                    napi_val,
+                    std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                  )?;
+                  #union_getter
+                });
+              } else if is_optional_field && !self.use_nullable {
+                obj_field_getters.push(quote! {
+                  let #raw_field_var = napi::bindgen_prelude::get_named_property_raw(
+                    env,
+                    napi_val,
+                    std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                  )?;
+                  let #arg_name: #ty = napi::bindgen_prelude::from_raw_optional_field(
+                    env,
+                    #raw_field_var,
+                    #name_str,
+                    #field_js_name,
+                  )?;
+                });
+              } else {
+                obj_field_getters.push(quote! {
+                  let #raw_field_var = napi::bindgen_prelude::get_named_property_raw(
+                    env,
+                    napi_val,
+                    std::ffi::CStr::from_bytes_with_nul_unchecked(#field_js_name_lit.as_bytes()),
+                  )?;
+                  let #arg_name: #ty = napi::bindgen_prelude::from_raw_required_field(
+                    env,
+                    #raw_field_var,
+                    #name_str,
+                    #field_js_name,
+                  )?;
+                });
+              }
+            } else if is_optional_field && !self.use_nullable {
               obj_field_getters.push(quote! { let #arg_name: #ty = obj.get(#field_js_name)?; });
             } else {
               obj_field_getters.push(quote! {
@@ -1198,6 +1789,21 @@ impl NapiStruct {
           ];
 
           napi::bindgen_prelude::create_object_with_properties(env, &properties)
+        }
+      } else if compact_to {
+        // Some fields are conditionally set - use raw setters in compact mode
+        quote! {
+          #(#value_conversions)*
+
+          let properties = [
+            #(#property_descriptors),*
+          ];
+
+          let obj_ptr = napi::bindgen_prelude::create_object_with_properties(env, &properties)?;
+
+          #(#conditional_setters)*
+
+          Ok(obj_ptr)
         }
       } else {
         // Some fields are conditionally set
@@ -1254,11 +1860,26 @@ impl NapiStruct {
           ) -> napi::bindgen_prelude::Result<Self> {
             #[allow(unused_variables)]
             let env_wrapper = napi::bindgen_prelude::Env::from(env);
-            #[allow(unused_mut)]
+            #[allow(unused_mut, unused_variables)]
             let mut obj = napi::bindgen_prelude::Object::from_napi_value(env, napi_val)?;
-            let type_: String = obj.get(#discriminant)
-              .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #discriminant))?
-              .ok_or_else(|| napi::bindgen_prelude::missing_field_error(#discriminant))?;
+            let type_: String = if #compact_from {
+              let __discriminant_raw = napi::bindgen_prelude::get_named_property_raw(
+                env,
+                napi_val,
+                std::ffi::CStr::from_bytes_with_nul_unchecked(#discriminant_null_terminated.as_bytes()),
+              )
+              .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #discriminant))?;
+              napi::bindgen_prelude::from_raw_required_field(
+                env,
+                __discriminant_raw,
+                #name_str,
+                #discriminant,
+              )?
+            } else {
+              obj.get(#discriminant)
+                .map_err(|err| napi::bindgen_prelude::decorate_field_error(err, #name_str, #discriminant))?
+                .ok_or_else(|| napi::bindgen_prelude::missing_field_error(#discriminant))?
+            };
             let val = match type_.as_str() {
               #(#variant_arm_getters)*
               _ => return Err(napi::bindgen_prelude::Error::new(

@@ -22,6 +22,44 @@ impl<T> From<Either<T, Null>> for Option<T> {
   }
 }
 
+#[doc(hidden)]
+pub struct UnionArmDescriptor {
+  pub type_name: fn() -> &'static str,
+  pub validate: unsafe fn(sys::napi_env, sys::napi_value) -> crate::Result<sys::napi_value>,
+}
+
+#[doc(hidden)]
+#[inline]
+pub unsafe fn select_union_arm(
+  env: sys::napi_env,
+  value: sys::napi_value,
+  arms: &[UnionArmDescriptor],
+) -> crate::Result<usize> {
+  for (index, arm) in arms.iter().enumerate() {
+    match unsafe { (arm.validate)(env, value) } {
+      Ok(maybe_rejected_promise) => {
+        if maybe_rejected_promise.is_null() {
+          return Ok(index);
+        }
+        silence_rejected_promise(env, maybe_rejected_promise)?;
+      }
+      Err(_) => {}
+    }
+  }
+
+  Err(crate::Error::new(
+    Status::InvalidArg,
+    format!(
+      "Value is none of these types {}",
+      arms
+        .iter()
+        .map(|arm| format!("`{}`", (arm.type_name)()))
+        .collect::<Vec<_>>()
+        .join(", "),
+    ),
+  ))
+}
+
 macro_rules! either_n {
   ( $either_name:ident, $( $parameter:ident ),+ $( , )* ) => {
     #[derive(Debug, Clone, Copy)]

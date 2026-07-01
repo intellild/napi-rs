@@ -125,7 +125,15 @@ pub struct NapiObject {
   pub fields: Vec<NapiStructField>,
   pub object_from_js: bool,
   pub object_to_js: bool,
+  pub codegen: ObjectCodegenMode,
   pub is_tuple: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectCodegenMode {
+  Auto,
+  Inline,
+  Compact,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +148,7 @@ pub struct NapiStructuredEnum {
   pub variants: Vec<NapiStructuredEnumVariant>,
   pub object_from_js: bool,
   pub object_to_js: bool,
+  pub codegen: ObjectCodegenMode,
   pub discriminant: String,
   pub discriminant_case: Option<Case<'static>>,
 }
