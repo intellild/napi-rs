@@ -7,10 +7,6 @@ version = "0.1.0"
 [lib]
 crate-type = ["cdylib"]
 
-[features]
-default = ["object-codegen-modes"]
-object-codegen-modes = []
-
 [dependencies]
 napi = { path = "../../crates/napi", default-features = false, features = [
   "napi10",

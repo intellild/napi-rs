@@ -34,36 +34,26 @@ const structured = {
   extra: 'tail',
 }
 
-const caseSpecs = [
-  ['small baseline from js', 'consumeSmallBaseline', [small]],
-  ['small inline from js', 'consumeSmallInline', [small]],
-  ['small compact from js', 'consumeSmallCompact', [small]],
-  ['small auto from js', 'consumeSmallAuto', [small]],
-  ['small baseline to js', 'createSmallBaseline', []],
-  ['small inline to js', 'createSmallInline', []],
-  ['small compact to js', 'createSmallCompact', []],
-  ['small auto to js', 'createSmallAuto', []],
-  ['medium baseline from js', 'consumeMediumBaseline', [medium]],
-  ['medium inline from js', 'consumeMediumInline', [medium]],
-  ['medium compact from js', 'consumeMediumCompact', [medium]],
-  ['medium auto from js', 'consumeMediumAuto', [medium]],
-  ['large baseline from js', 'consumeLargeBaseline', [large]],
-  ['large inline from js', 'consumeLargeInline', [large]],
-  ['large compact from js', 'consumeLargeCompact', [large]],
-  ['large auto from js', 'consumeLargeAuto', [large]],
-  ['union baseline from js', 'consumeUnionBaseline', [union]],
-  ['union inline from js', 'consumeUnionInline', [union]],
-  ['union compact from js', 'consumeUnionCompact', [union]],
-  ['union auto from js', 'consumeUnionAuto', [union]],
-  ['structured baseline from js', 'consumeStructuredBaseline', [structured]],
-  ['structured inline from js', 'consumeStructuredInline', [structured]],
-  ['structured compact from js', 'consumeStructuredCompact', [structured]],
-  ['structured auto from js', 'consumeStructuredAuto', [structured]],
+const cases = [
+  ['small inline from js', () => native.consumeSmallInline(small)],
+  ['small compact from js', () => native.consumeSmallCompact(small)],
+  ['small auto from js', () => native.consumeSmallAuto(small)],
+  ['small inline to js', () => native.createSmallInline()],
+  ['small compact to js', () => native.createSmallCompact()],
+  ['small auto to js', () => native.createSmallAuto()],
+  ['medium inline from js', () => native.consumeMediumInline(medium)],
+  ['medium compact from js', () => native.consumeMediumCompact(medium)],
+  ['medium auto from js', () => native.consumeMediumAuto(medium)],
+  ['large inline from js', () => native.consumeLargeInline(large)],
+  ['large compact from js', () => native.consumeLargeCompact(large)],
+  ['large auto from js', () => native.consumeLargeAuto(large)],
+  ['union inline from js', () => native.consumeUnionInline(union)],
+  ['union compact from js', () => native.consumeUnionCompact(union)],
+  ['union auto from js', () => native.consumeUnionAuto(union)],
+  ['structured inline from js', () => native.consumeStructuredInline(structured)],
+  ['structured compact from js', () => native.consumeStructuredCompact(structured)],
+  ['structured auto from js', () => native.consumeStructuredAuto(structured)],
 ]
-
-const cases = caseSpecs
-  .filter(([, exportName]) => typeof native[exportName] === 'function')
-  .map(([name, exportName, args]) => [name, () => native[exportName](...args)])
 
 function percentile(values, percentileValue) {
   const index = Math.min(

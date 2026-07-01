@@ -5,9 +5,6 @@
   "type": "module",
   "scripts": {
     "build": "napi-raw build --release",
-    "build:baseline": "napi-raw build --release --no-default-features",
-    "bench:baseline": "yarn build:baseline && node bench.mjs",
-    "bench:modes": "yarn build && node bench.mjs",
     "bench": "node bench.mjs"
   },
   "napi": {
